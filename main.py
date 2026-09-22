@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""服务入口：uvicorn main:app 启动本地做市资金池服务。"""
 
-app = FastAPI()
+from app.api import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
