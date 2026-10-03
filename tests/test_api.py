@@ -10,7 +10,7 @@ from main import app
 
 @pytest.fixture
 def client():
-    api_mod.service.reset()
+    api_mod.service.store.reset()  # 同步清空内存状态（reset() 是协程，直接调用不会生效）
     with TestClient(app) as c:
         yield c
 

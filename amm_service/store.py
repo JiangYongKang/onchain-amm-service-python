@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from .models import IdempotentResult, PoolState, Position
+from .models import IdempotentResult, LedgerEntry, PoolPolicy, PoolState, Position
 
 
 @dataclass
@@ -22,6 +22,8 @@ class Store:
     positions: dict[tuple[str, str], Position] = field(default_factory=dict)
     idempotency: dict[tuple[str, str], IdempotentResult] = field(default_factory=dict)
     pool_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    policies: dict[str, PoolPolicy] = field(default_factory=dict)
+    ledger: list[LedgerEntry] = field(default_factory=list)
     _guard: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def pool_lock(self, pool_id: str) -> asyncio.Lock:
@@ -44,8 +46,20 @@ class Store:
     def get_position(self, pool_id: str, user: str) -> Position:
         return self.positions.setdefault((pool_id, user), Position())
 
+    def get_policy(self, pool_id: str) -> PoolPolicy:
+        """池子未配置策略时返回默认（不限容量、不熔断）。"""
+        return self.policies.setdefault(pool_id, PoolPolicy())
+
+    def append_ledger(self, entry: LedgerEntry) -> None:
+        self.ledger.append(entry)
+
+    def next_seq(self) -> int:
+        return len(self.ledger) + 1
+
     def reset(self) -> None:
         self.pools.clear()
         self.positions.clear()
         self.idempotency.clear()
         self.pool_locks.clear()
+        self.policies.clear()
+        self.ledger.clear()

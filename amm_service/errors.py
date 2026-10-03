@@ -41,3 +41,27 @@ class InsufficientShareBalance(AmmError):
 
 class DuplicateRequestConflict(AmmError):
     code = "DUPLICATE_REQUEST_CONFLICT"
+
+
+class PoolAlreadyExists(AmmError):
+    """重复初始化同一池子且参数与既有池子不一致。"""
+
+    code = "POOL_ALREADY_EXISTS"
+
+
+class SwapAmountExceedsLimit(AmmError):
+    """单笔兑换输入超过池子容量上限。"""
+
+    code = "SWAP_AMOUNT_EXCEEDS_LIMIT"
+
+
+class ReserveBufferViolation(AmmError):
+    """成交后输出侧库存将跌破池子缓冲水位。"""
+
+    code = "RESERVE_BUFFER_VIOLATION"
+
+
+class PoolPaused(AmmError):
+    """池子的对应操作已被管理员暂停。"""
+
+    code = "POOL_PAUSED"

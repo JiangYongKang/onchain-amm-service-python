@@ -49,3 +49,14 @@ class QuoteRequest(BaseModel):
     pool_id: str
     side: str
     amount_in: int = Field(ge=0)
+
+
+class PoolPolicyRequest(BaseModel):
+    """容量策略：None 表示该项保持不变，0 表示不启用。"""
+
+    max_swap_in: int | None = Field(default=None, ge=0)
+    reserve_buffer: int | None = Field(default=None, ge=0)
+
+
+class PauseRequest(BaseModel):
+    ops: list[str] = Field(min_length=1)

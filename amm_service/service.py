@@ -27,13 +27,17 @@ from .errors import (
     InsufficientLiquidity,
     InsufficientShareBalance,
     InvalidParameter,
+    PoolAlreadyExists,
     PoolNotFound,
+    PoolPaused,
     RequestExpired,
+    ReserveBufferViolation,
     SlippageExceeded,
     StaleQuote,
+    SwapAmountExceedsLimit,
 )
-from .models import IdempotentResult, PoolState
-from . import pricing
+from .models import IdempotentResult, LedgerEntry, PoolPolicy, PoolState
+from . import ledger, pricing, stats
 from .store import Store
 
 logger = logging.getLogger("amm.service")
@@ -49,6 +53,9 @@ _REPLAYABLE: dict[str, type[AmmError]] = {
     "INSUFFICIENT_LIQUIDITY": InsufficientLiquidity,
     "SLIPPAGE_EXCEEDED": SlippageExceeded,
     "INSUFFICIENT_SHARE_BALANCE": InsufficientShareBalance,
+    "POOL_PAUSED": PoolPaused,
+    "SWAP_AMOUNT_EXCEEDS_LIMIT": SwapAmountExceedsLimit,
+    "RESERVE_BUFFER_VIOLATION": ReserveBufferViolation,
 }
 
 
@@ -81,6 +88,10 @@ class AmmService:
 
         两侧均为正时，按 min(x,y) 给系统账户铸造份额，池子立即可供兑换；
         两侧为 0 时池子未激活，等待首笔流动性注入；不允许只给单侧库存。
+
+        重复初始化：池子已存在时不再叠加库存/份额——
+        参数与既有池子完全一致则原样返回既有状态（created=False）；
+        参数不一致则以 POOL_ALREADY_EXISTS 明确拒绝。
         """
         if not pool_id or not token_x or not token_y:
             raise InvalidParameter("pool_id/token_x/token_y must be non-empty")
@@ -93,6 +104,25 @@ class AmmService:
 
         lock = await self.store.pool_lock(pool_id)
         async with lock:
+            existing = self.store.pools.get(pool_id)
+            if existing is not None:
+                same = (
+                    existing.token_x == token_x and existing.token_y == token_y
+                    and existing.fee_ppm == fee_ppm
+                    # 存量可能已被成交改变，只有「尚未发生任何业务」的池子
+                    # 才允许用相同存量参数幂等重放创建。
+                    and existing.reserve_x == reserve_x
+                    and existing.reserve_y == reserve_y
+                )
+                if same:
+                    view = self._pool_view(existing)
+                    view["created"] = False
+                    _log_event("seed_pool", decision="replayed",
+                               pool_id=pool_id, after=view)
+                    return view
+                raise PoolAlreadyExists(
+                    f"pool {pool_id!r} already exists with different parameters"
+                )
             pool = PoolState(
                 pool_id=pool_id, token_x=token_x, token_y=token_y,
                 reserve_x=reserve_x, reserve_y=reserve_y, fee_ppm=fee_ppm,
@@ -102,8 +132,10 @@ class AmmService:
                 pool.total_shares = shares
                 self.store.get_position(pool_id, _SYSTEM_USER).shares += shares
             self.store.pools[pool_id] = pool
-            _log_event("seed_pool", pool_id=pool_id, after=self._pool_view(pool))
-            return self._pool_view(pool)
+            view = self._pool_view(pool)
+            view["created"] = True
+            _log_event("seed_pool", pool_id=pool_id, after=view)
+            return view
 
     async def get_pool(self, pool_id: str) -> dict:
         return self._pool_view(self.store.get_pool(pool_id))
@@ -112,6 +144,77 @@ class AmmService:
         self.store.get_pool(pool_id)
         pos = self.store.get_position(pool_id, user)
         return {"pool_id": pool_id, "user": user, "shares": pos.shares}
+
+    # ------------------------------------------------------------------ #
+    # 流水历史与手续费对账
+    # ------------------------------------------------------------------ #
+    async def get_history(self, *, pool_id: str | None = None,
+                          user: str | None = None, op: str | None = None,
+                          since_ms: int | None = None,
+                          until_ms: int | None = None,
+                          page: int = 1, page_size: int = 50) -> dict:
+        """分页查询交易流水；total 为过滤后全集大小，与页码无关。"""
+        entries = ledger.filter_entries(
+            self.store.ledger, pool_id=pool_id, user=user, op=op,
+            since_ms=since_ms, until_ms=until_ms,
+        )
+        return ledger.paginate(entries, page=page, page_size=page_size)
+
+    async def get_pool_stats(self, pool_id: str) -> dict:
+        """池子维度对账：本金（净存入）与手续费分列，全部可从流水重推。"""
+        pool = self.store.get_pool(pool_id)
+        trading = stats.pool_trading_stats(self.store.ledger, pool_id)
+        deposited_x = deposited_y = 0
+        withdrawn_x = withdrawn_y = 0
+        for e in self.store.ledger:
+            if e.pool_id != pool_id or e.status != "success":
+                continue
+            if e.op == "add":
+                deposited_x += e.detail["amount_x"]
+                deposited_y += e.detail["amount_y"]
+            elif e.op == "remove":
+                withdrawn_x += e.detail["amount_x"]
+                withdrawn_y += e.detail["amount_y"]
+        return {
+            **trading,
+            "reserve_x": pool.reserve_x,
+            "reserve_y": pool.reserve_y,
+            "deposited_x": deposited_x,
+            "deposited_y": deposited_y,
+            "withdrawn_x": withdrawn_x,
+            "withdrawn_y": withdrawn_y,
+            "total_shares": pool.total_shares,
+            "fee_ppm": pool.fee_ppm,
+        }
+
+    async def get_user_stats(self, pool_id: str, user: str) -> dict:
+        """用户维度：份额占比、应得手续费分成（两侧）、累计贡献。"""
+        pool = self.store.get_pool(pool_id)
+        pos = self.store.get_position(pool_id, user)
+        trading = stats.pool_trading_stats(self.store.ledger, pool_id)
+        contrib = stats.user_contributions(self.store.ledger, pool_id).get(
+            user, {"deposited_x": 0, "deposited_y": 0, "add_count": 0}
+        )
+        share_ppm = (
+            pos.shares * stats.FEE_DENOMINATOR // pool.total_shares
+            if pool.total_shares > 0 else 0
+        )
+        return {
+            "pool_id": pool_id,
+            "user": user,
+            "shares": pos.shares,
+            "total_shares": pool.total_shares,
+            "share_ppm": share_ppm,  # 份额占比，百万分比
+            "fee_entitled_x": stats.user_fee_entitlement(
+                trading["fee_x"], pos.shares, pool.total_shares
+            ),
+            "fee_entitled_y": stats.user_fee_entitlement(
+                trading["fee_y"], pos.shares, pool.total_shares
+            ),
+            "deposited_x": contrib["deposited_x"],
+            "deposited_y": contrib["deposited_y"],
+            "add_count": contrib["add_count"],
+        }
 
     async def quote(self, *, pool_id: str, side: str, amount_in: int) -> dict:
         if side not in VALID_SIDES:
@@ -137,6 +240,79 @@ class AmmService:
         self.store.reset()
 
     # ------------------------------------------------------------------ #
+    # 运营策略：容量上限 / 缓冲水位 / 熔断
+    # ------------------------------------------------------------------ #
+    _VALID_OPS = ("swap", "add", "remove")
+
+    async def set_pool_policy(self, pool_id: str, *,
+                              max_swap_in: int | None = None,
+                              reserve_buffer: int | None = None) -> dict:
+        """设置池子容量策略；None 表示该项保持不变，0 表示不启用。
+
+        策略只影响设置之后受理的请求：已接受（已记账）的请求结果不变，
+        幂等回放仍返回首次判定。
+        """
+        if max_swap_in is not None and max_swap_in < 0:
+            raise InvalidParameter("max_swap_in must be >= 0")
+        if reserve_buffer is not None and reserve_buffer < 0:
+            raise InvalidParameter("reserve_buffer must be >= 0")
+        lock = await self.store.pool_lock(pool_id)
+        async with lock:
+            self.store.get_pool(pool_id)  # 池子必须存在
+            policy = self.store.get_policy(pool_id)
+            if max_swap_in is not None:
+                policy.max_swap_in = max_swap_in
+            if reserve_buffer is not None:
+                policy.reserve_buffer = reserve_buffer
+            view = self._policy_view(pool_id, policy)
+            _log_event("set_pool_policy", pool_id=pool_id, policy=view)
+            return view
+
+    async def pause_pool(self, pool_id: str, ops: list[str]) -> dict:
+        """熔断：暂停指定操作；暂停期间对应请求以 POOL_PAUSED 拒绝。"""
+        return await self._set_paused(pool_id, ops, pause=True)
+
+    async def resume_pool(self, pool_id: str, ops: list[str]) -> dict:
+        """恢复：解除指定操作的熔断；恢复后从当前存量继续。"""
+        return await self._set_paused(pool_id, ops, pause=False)
+
+    async def _set_paused(self, pool_id: str, ops: list[str],
+                          pause: bool) -> dict:
+        if not ops:
+            raise InvalidParameter("ops must be non-empty")
+        bad = [o for o in ops if o not in self._VALID_OPS]
+        if bad:
+            raise InvalidParameter(
+                f"ops must be subset of {self._VALID_OPS}, got {bad}"
+            )
+        lock = await self.store.pool_lock(pool_id)
+        async with lock:
+            self.store.get_pool(pool_id)
+            policy = self.store.get_policy(pool_id)
+            paused = set(policy.paused_ops)
+            if pause:
+                paused |= set(ops)
+            else:
+                paused -= set(ops)
+            policy.paused_ops = frozenset(paused)
+            view = self._policy_view(pool_id, policy)
+            _log_event("pause_pool" if pause else "resume_pool",
+                       pool_id=pool_id, ops=ops, policy=view)
+            return view
+
+    async def get_pool_policy(self, pool_id: str) -> dict:
+        self.store.get_pool(pool_id)
+        return self._policy_view(pool_id, self.store.get_policy(pool_id))
+
+    def _policy_view(self, pool_id: str, policy: PoolPolicy) -> dict:
+        return {
+            "pool_id": pool_id,
+            "max_swap_in": policy.max_swap_in,
+            "reserve_buffer": policy.reserve_buffer,
+            "paused_ops": sorted(policy.paused_ops),
+        }
+
+    # ------------------------------------------------------------------ #
     # 流动性
     # ------------------------------------------------------------------ #
     async def add_liquidity(self, *, request_id: str, pool_id: str, user: str,
@@ -146,11 +322,12 @@ class AmmService:
             ["add", pool_id, user, amount_x, amount_y, min_shares, deadline_ms]
         )
 
-        async def action(pool: PoolState) -> dict:
+        async def action(pool: PoolState) -> tuple[dict, dict]:
             if not user:
                 raise InvalidParameter("user must be non-empty")
             if amount_x <= 0 or amount_y <= 0:
                 raise InvalidParameter("amount_x and amount_y must be positive")
+            self._check_not_paused(pool_id, "add")
             self._check_deadline(deadline_ms)
             before = pool.clone()
 
@@ -181,6 +358,8 @@ class AmmService:
             self.store.get_position(pool_id, user).shares += shares
             result = {"request_id": request_id, "shares": shares,
                       "replayed": False, "pool": self._pool_view(pool)}
+            detail = {"amount_x": amount_x, "amount_y": amount_y,
+                      "shares": shares}
             _log_event(
                 "add_liquidity", decision="accepted", request_id=request_id,
                 user=user,
@@ -189,9 +368,14 @@ class AmmService:
                 before=self._pool_view(before), after=self._pool_view(pool),
                 reason="shares=min(floor(dx*S/Rx),floor(dy*S/Ry))",
             )
-            return result
+            return result, detail
 
-        return await self._with_idempotency("add", request_id, pool_id, fp, action)
+        return await self._with_idempotency(
+            "add", request_id, pool_id, user, fp,
+            {"amount_x": amount_x, "amount_y": amount_y,
+             "min_shares": min_shares, "deadline_ms": deadline_ms},
+            action,
+        )
 
     async def remove_liquidity(self, *, request_id: str, pool_id: str, user: str,
                                shares: int, min_x: int = 0, min_y: int = 0,
@@ -200,11 +384,12 @@ class AmmService:
             ["remove", pool_id, user, shares, min_x, min_y, deadline_ms]
         )
 
-        async def action(pool: PoolState) -> dict:
+        async def action(pool: PoolState) -> tuple[dict, dict]:
             if not user:
                 raise InvalidParameter("user must be non-empty")
             if shares <= 0:
                 raise InvalidParameter("shares must be positive")
+            self._check_not_paused(pool_id, "remove")
             self._check_deadline(deadline_ms)
             before = pool.clone()
 
@@ -246,6 +431,7 @@ class AmmService:
                 "remaining_shares": pos.shares,
                 "replayed": False, "pool": self._pool_view(pool),
             }
+            detail = {"shares": shares, "amount_x": out_x, "amount_y": out_y}
             _log_event(
                 "remove_liquidity", decision="accepted", request_id=request_id,
                 user=user,
@@ -254,9 +440,14 @@ class AmmService:
                 before=self._pool_view(before), after=self._pool_view(pool),
                 reason="out=floor(shares*R/S); shares burned exactly",
             )
-            return result
+            return result, detail
 
-        return await self._with_idempotency("remove", request_id, pool_id, fp, action)
+        return await self._with_idempotency(
+            "remove", request_id, pool_id, user, fp,
+            {"shares": shares, "min_x": min_x, "min_y": min_y,
+             "deadline_ms": deadline_ms},
+            action,
+        )
 
     # ------------------------------------------------------------------ #
     # 兑换
@@ -270,13 +461,22 @@ class AmmService:
             quoted_out, quote_version, deadline_ms,
         ])
 
-        async def action(pool: PoolState) -> dict:
+        async def action(pool: PoolState) -> tuple[dict, dict]:
             if not user:
                 raise InvalidParameter("user must be non-empty")
             if side not in VALID_SIDES:
                 raise InvalidParameter(f"side must be one of {VALID_SIDES}")
             if amount_in <= 0:
                 raise InvalidParameter("amount_in must be positive")
+            # 熔断与容量闸门：参数校验之后、业务校验之前，
+            # 被暂停/超限的请求以独立错误码拒绝且不改账。
+            policy = self.store.get_policy(pool_id)
+            self._check_not_paused(pool_id, "swap")
+            if policy.max_swap_in > 0 and amount_in > policy.max_swap_in:
+                raise SwapAmountExceedsLimit(
+                    f"amount_in {amount_in} exceeds pool max_swap_in "
+                    f"{policy.max_swap_in}"
+                )
             self._check_deadline(deadline_ms)
             before = pool.clone()
 
@@ -302,6 +502,14 @@ class AmmService:
                     f"no liquidity to fill swap: reserve_out={reserve_out}, "
                     f"amount_out={out}"
                 )
+            # 缓冲水位：成交后输出侧库存不得低于池子设定的安全水位。
+            if policy.reserve_buffer > 0 and (
+                reserve_out - out < policy.reserve_buffer
+            ):
+                raise ReserveBufferViolation(
+                    f"post-swap reserve_out {reserve_out - out} would fall "
+                    f"below buffer {policy.reserve_buffer}"
+                )
             # 最小成交保护。
             if out < min_out:
                 raise SlippageExceeded(
@@ -323,6 +531,12 @@ class AmmService:
                 "replayed": False,
                 "pool": self._pool_view(pool),
             }
+            detail = {
+                "side": side,
+                "amount_in": amount_in,
+                "amount_out": out,
+                "fee_ppm": pool.fee_ppm,
+            }
             _log_event(
                 "swap", decision="accepted", request_id=request_id, user=user,
                 input={"side": side, "amount_in": amount_in, "min_out": min_out,
@@ -332,9 +546,15 @@ class AmmService:
                 reason=(f"out=floor(Rout*ain*(1e6-f)/(Rin*1e6+ain*(1e6-f)))"
                         f"={out}; k_after>=k_before"),
             )
-            return result
+            return result, detail
 
-        return await self._with_idempotency("swap", request_id, pool_id, fp, action)
+        return await self._with_idempotency(
+            "swap", request_id, pool_id, user, fp,
+            {"side": side, "amount_in": amount_in, "min_out": min_out,
+             "quoted_out": quoted_out, "quote_version": quote_version,
+             "deadline_ms": deadline_ms},
+            action,
+        )
 
     # ------------------------------------------------------------------ #
     # 内部工具
@@ -344,8 +564,10 @@ class AmmService:
         scope: str,
         request_id: str,
         pool_id: str,
+        user: str,
         fingerprint: str,
-        action: Callable[[PoolState], Awaitable[dict]],
+        input_detail: dict,
+        action: Callable[[PoolState], Awaitable[tuple[dict, dict]]],
     ) -> dict:
         if not request_id:
             raise InvalidParameter("request_id must be non-empty")
@@ -383,14 +605,18 @@ class AmmService:
                     "POOL_NOT_FOUND", fingerprint, pool_id,
                     f"pool not found: {pool_id}",
                 )
+                self._record_ledger(scope, request_id, pool_id, user,
+                                    "rejected", "POOL_NOT_FOUND", input_detail)
                 raise PoolNotFound(f"pool not found: {pool_id}")
 
             try:
-                result = await action(pool)
+                result, success_detail = await action(pool)
             except AmmError as exc:
                 self.store.idempotency[key] = self._rejection(
                     exc.code, fingerprint, pool_id, str(exc),
                 )
+                self._record_ledger(scope, request_id, pool_id, user,
+                                    "rejected", exc.code, input_detail)
                 _log_event(
                     f"{scope}_rejected", decision="rejected",
                     request_id=request_id, pool_id=pool_id,
@@ -401,7 +627,25 @@ class AmmService:
                 status="success", payload=dict(result),
                 fingerprint=fingerprint, pool_id=pool_id,
             )
+            self._record_ledger(scope, request_id, pool_id, user,
+                                "success", "", success_detail)
             return result
+
+    def _record_ledger(self, op: str, request_id: str, pool_id: str,
+                       user: str, status: str, error_code: str,
+                       detail: dict) -> None:
+        """每笔被受理的请求恰好一条流水；回放/冲突不新增记录。"""
+        self.store.append_ledger(LedgerEntry(
+            seq=self.store.next_seq(),
+            ts_ms=self.now_ms(),
+            pool_id=pool_id,
+            user=user,
+            op=op,
+            request_id=request_id,
+            status=status,
+            error_code=error_code,
+            detail=dict(detail),
+        ))
 
     def _rejection(self, code: str, fingerprint: str, pool_id: str,
                    message: str) -> IdempotentResult:
@@ -417,6 +661,10 @@ class AmmService:
             raise RequestExpired(
                 f"request expired at {deadline_ms}ms, now={self.now_ms()}ms"
             )
+
+    def _check_not_paused(self, pool_id: str, op: str) -> None:
+        if self.store.get_policy(pool_id).is_paused(op):
+            raise PoolPaused(f"operation {op!r} is paused on pool {pool_id!r}")
 
     def _quote_amount(self, pool: PoolState, side: str, amount_in: int) -> int:
         if side == "x_to_y":

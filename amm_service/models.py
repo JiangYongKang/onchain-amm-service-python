@@ -56,3 +56,40 @@ class IdempotentResult:
     payload: dict = field(default_factory=dict)
     fingerprint: str = ""  # 请求要素摘要，用于识别同 id 不同参的冲突重试
     pool_id: str = ""
+
+
+@dataclass
+class PoolPolicy:
+    """池子运营策略：容量上限、缓冲水位与熔断开关。
+
+    - max_swap_in：单笔兑换输入上限（输入侧最小单位），0 表示不限。
+    - reserve_buffer：输出侧库存缓冲水位，成交后 reserve_out 不得低于该值，
+      0 表示不启用。
+    - paused_ops：被熔断的操作集合，取值 "swap" | "add" | "remove"。
+    """
+
+    max_swap_in: int = 0
+    reserve_buffer: int = 0
+    paused_ops: frozenset[str] = frozenset()
+
+    def is_paused(self, op: str) -> bool:
+        return op in self.paused_ops
+
+
+@dataclass
+class LedgerEntry:
+    """交易流水：每笔被受理的请求（成功或被拒）恰好记录一条。
+
+    seq 为全局单调序号；同一 (op, request_id) 只会产生一条记录，
+    幂等回放不新增流水。
+    """
+
+    seq: int
+    ts_ms: int
+    pool_id: str
+    user: str
+    op: str  # "add" | "remove" | "swap"
+    request_id: str
+    status: str  # "success" | "rejected"
+    error_code: str = ""  # 拒绝时的稳定错误码，成功时为空
+    detail: dict = field(default_factory=dict)  # 业务要素：金额、份额、方向等

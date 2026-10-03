@@ -5,6 +5,8 @@ from fastapi import APIRouter
 
 from .schemas import (
     AddLiquidityRequest,
+    PauseRequest,
+    PoolPolicyRequest,
     QuoteRequest,
     RemoveLiquidityRequest,
     SeedPoolRequest,
@@ -78,3 +80,55 @@ async def get_position(pool_id: str, user: str) -> dict:
 async def reset() -> dict:
     await service.reset()
     return {"ok": True}
+
+
+# --------------------------------------------------------------------- #
+# 运营策略：容量上限 / 缓冲水位 / 熔断
+# --------------------------------------------------------------------- #
+@router.put("/admin/pools/{pool_id}/policy")
+async def set_pool_policy(pool_id: str, req: PoolPolicyRequest) -> dict:
+    result = await service.set_pool_policy(
+        pool_id, max_swap_in=req.max_swap_in, reserve_buffer=req.reserve_buffer,
+    )
+    return {"ok": True, "result": result}
+
+
+@router.get("/admin/pools/{pool_id}/policy")
+async def get_pool_policy(pool_id: str) -> dict:
+    return {"ok": True, "result": await service.get_pool_policy(pool_id)}
+
+
+@router.post("/admin/pools/{pool_id}/pause")
+async def pause_pool(pool_id: str, req: PauseRequest) -> dict:
+    return {"ok": True, "result": await service.pause_pool(pool_id, req.ops)}
+
+
+@router.post("/admin/pools/{pool_id}/resume")
+async def resume_pool(pool_id: str, req: PauseRequest) -> dict:
+    return {"ok": True, "result": await service.resume_pool(pool_id, req.ops)}
+
+
+# --------------------------------------------------------------------- #
+# 流水历史与手续费对账
+# --------------------------------------------------------------------- #
+@router.get("/history")
+async def get_history(pool_id: str | None = None, user: str | None = None,
+                      op: str | None = None, since_ms: int | None = None,
+                      until_ms: int | None = None,
+                      page: int = 1, page_size: int = 50) -> dict:
+    result = await service.get_history(
+        pool_id=pool_id, user=user, op=op,
+        since_ms=since_ms, until_ms=until_ms,
+        page=page, page_size=page_size,
+    )
+    return {"ok": True, "result": result}
+
+
+@router.get("/pools/{pool_id}/stats")
+async def get_pool_stats(pool_id: str) -> dict:
+    return {"ok": True, "result": await service.get_pool_stats(pool_id)}
+
+
+@router.get("/pools/{pool_id}/users/{user}/stats")
+async def get_user_stats(pool_id: str, user: str) -> dict:
+    return {"ok": True, "result": await service.get_user_stats(pool_id, user)}
