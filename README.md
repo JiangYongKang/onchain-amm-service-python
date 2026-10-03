@@ -19,7 +19,7 @@ amm_service/
   schemas.py   # HTTP 请求模型
   api.py       # FastAPI 路由
 main.py        # 应用入口与统一错误响应
-tests/         # 计价 / 流动性 / 兑换 / 并发 / HTTP 测试
+tests/         # 计价 / 流动性 / 兑换 / 并发 / 手续费对账 / 流水历史 / 容量熔断 / HTTP 测试
 ```
 
 ## 本地运行
@@ -34,13 +34,19 @@ uv run uvicorn main:app --reload
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/admin/pools` | 播种本地池子（初始库存、代币名、手续费） |
+| POST | `/admin/pools` | 播种本地池子（初始库存、代币名、手续费）；重复初始化见下文 |
 | POST | `/liquidity/add` | 注入流动性（需 `request_id` 幂等） |
 | POST | `/liquidity/remove` | 赎回份额（需 `request_id` 幂等） |
 | POST | `/quotes` | 询价，返回期望输出与 `pool_version` |
 | POST | `/swaps` | 兑换（需 `request_id`，支持成交保护） |
-| GET  | `/pools/{pool_id}` | 查询池子状态 |
+| GET  | `/pools/{pool_id}` | 查询池子状态（含容量/暂停策略字段） |
 | GET  | `/pools/{pool_id}/positions/{user}` | 查询用户份额 |
+| GET  | `/pools/{pool_id}/stats` | 池子对账统计：本金/手续费/成交笔数/成交量 |
+| GET  | `/pools/{pool_id}/users/{user}/stats` | 用户统计：份额占比、应得手续费分成、累计贡献 |
+| GET  | `/history` | 交易流水分页查询（pool_id/user/op/status/时间范围过滤） |
+| POST | `/admin/pools/{pool_id}/policy` | 设置容量策略（`max_swap_in`、`reserve_buffer`） |
+| POST | `/admin/pools/{pool_id}/pause` | 暂停某类操作（`{"op": "swap"\|"add"\|"remove"}`） |
+| POST | `/admin/pools/{pool_id}/resume` | 恢复某类操作 |
 | POST | `/admin/reset` | 清空全部本地状态 |
 
 ### 典型调用顺序
@@ -113,6 +119,69 @@ out_y = floor( shares * Ry / S )
 
 任何时刻：`sum(所有用户持仓) == pool.total_shares`（测试强制断言）。
 
+## 手续费口径与归属规则
+
+- **计费口径**：手续费从输入侧内扣。
+  `effective_in = floor(amount_in * (1_000_000 - fee_ppm) / 1_000_000)`，
+  `fee = amount_in - effective_in`。手续费留在输入侧库存中，随池子归全体
+  流动性提供者按份额共有；兑换响应与流水 `detail.fee_in` 均携带该值。
+- **本金与手续费分离**：池子维护只增计数器——`deposited_*`（注入累计，含
+  seed 初始库存）、`withdrawn_*`（赎回累计）、`swap_in_* / swap_out_*`
+  （兑换流量）、`fee_*`（手续费累计）、`swap_count_*`（分方向笔数）。
+  `GET /pools/{pool_id}/stats` 返回全部计数器与净本金
+  `principal_* = deposited_* - withdrawn_*`。
+- **库存恒等式**（测试强制断言，可按侧核对）：
+
+  ```
+  reserve == deposited - withdrawn + swap_in - swap_out
+  ```
+
+- **可从流水重推**：每笔成功兑换在流水 `detail` 中记录
+  `side / amount_in / amount_out / fee_in`，统计端点的每个数字都等于对
+  `GET /history?op=swap&status=success` 逐笔求和的结果（测试逐字段断言）。
+- **用户视角**：`GET /pools/{pool_id}/users/{user}/stats` 返回
+  `shares`、`share_ppm`（份额占比，百万分比）、`fee_share_x/y`
+  （应得手续费分成 = `floor(shares * fee_total / total_shares)`，按当前
+  持仓快照）与 `contributed_* / withdrawn_*`（累计注入/赎回）。
+  分成向下取整，舍入余量留在池内未分配——全体用户分成之和不超过池子
+  累计手续费，不凭空多发资产。
+
+## 交易流水历史
+
+- 每笔**成功与被拒绝**的操作（含 seed、policy、pause/resume 管理操作）
+  都写一条流水：全局单调 `seq`、`ts_ms`、池子、用户、操作类型、
+  `request_id`、状态与失败原因码、业务明细 `detail`。
+- **幂等去重**：同一 `(操作类型, request_id)` 只记一条；成功/失败的重放
+  以及池不存在的重复请求都不会产生第二条记录。
+- **查询**：`GET /history`，过滤参数 `pool_id`、`user`、`op`
+  （seed/add/remove/swap/policy/pause/resume）、`status`
+  （success/rejected）、`since_ms`/`until_ms`（闭区间），分页参数
+  `page`（>=1）、`page_size`（1..500）。每页返回的 `total` 恒等于
+  过滤后的记录总数；参数非法以 `INVALID_PARAMETER` 明确拒绝。
+
+## 容量与熔断
+
+- **容量策略**（`POST /admin/pools/{pool_id}/policy`，字段缺省表示不变）：
+  - `max_swap_in`：单笔兑换输入上限，0 = 不限；超限以
+    `AMOUNT_LIMIT_EXCEEDED` 拒绝（恰好等于上限可成交）。
+  - `reserve_buffer`：输出侧缓冲水位，0 = 不限；成交后输出侧库存低于
+    水位以 `RESERVE_BUFFER_BREACH` 拒绝（恰好等于水位可成交）。
+- **熔断**：`POST /admin/pools/{pool_id}/pause|resume`，按操作类型
+  （swap/add/remove）独立暂停/恢复。暂停期间对应请求以 `POOL_PAUSED`
+  明确拒绝，校验发生在任何改账之前，不留部分状态；暂停只作用于目标池子。
+- **策略语义**：所有校验与落账在同一把池子锁内原子完成——策略切换只影响
+  切换后新到达的请求；已接受的请求不会被改判，其幂等重放仍返回首次结果；
+  暂停/恢复不触碰存量与份额，恢复后的第一笔交易从当前真实存量继续定价。
+
+## 重复初始化语义
+
+同一 `pool_id` 重复调用 `POST /admin/pools`：
+
+- 代币对与手续费率相同：视为幂等重试，**原样返回当前状态**并带
+  `"already_exists": true`，不改动存量、份额与版本（修复了历史上重复
+  初始化会悄悄叠加存量与份额的问题）；
+- 配置不同：以 `POOL_ALREADY_EXISTS` 明确拒绝并记入流水。
+
 ## 成交保护与失败原因分类
 
 兑换按下述顺序校验，每个失败都有独立、稳定的错误码：
@@ -132,6 +201,10 @@ out_y = floor( shares * Ry / S )
 | `POOL_NOT_FOUND` | 池子不存在（同样被幂等记录，重复请求回放同一错误） |
 | `INSUFFICIENT_SHARE_BALANCE` | 赎回份额超过持仓 |
 | `DUPLICATE_REQUEST_CONFLICT` | 同一 `request_id` 被用于**不同业务要素**的请求 |
+| `POOL_ALREADY_EXISTS` | 以不同配置重复初始化同一池子 |
+| `POOL_PAUSED` | 该类操作（swap/add/remove）已被管理员暂停 |
+| `AMOUNT_LIMIT_EXCEEDED` | 单笔兑换输入超过池子 `max_swap_in` 上限 |
+| `RESERVE_BUFFER_BREACH` | 成交后输出侧库存将低于 `reserve_buffer` 水位 |
 
 ## 并发与幂等语义
 
@@ -154,8 +227,12 @@ out_y = floor( shares * Ry / S )
 uv run pytest -v
 
 # 只看某类场景
-uv run pytest tests/test_concurrency.py -v
-uv run pytest tests/test_swap.py -v
+uv run pytest tests/test_concurrency.py -v   # 并发与幂等
+uv run pytest tests/test_swap.py -v          # 兑换保护
+uv run pytest tests/test_fees_stats.py -v    # 手续费对账与用户统计
+uv run pytest tests/test_history.py -v       # 流水历史与分页
+uv run pytest tests/test_policy.py -v        # 容量、熔断、重复初始化
+uv run pytest tests/test_ops_api.py -v       # 新能力的 HTTP 端到端
 
 # 启动服务手工验证
 uv run uvicorn main:app --reload
@@ -175,7 +252,12 @@ idempotency_replay {"decision":"replayed", ...}
 1. 成功兑换后 `reserve_x * reserve_y` 不减少；
 2. 库存净变化 == 累计投入 − 累计产出；
 3. 持仓总和 == 总份额；
-4. 并发 N 笔成交后 `version` 恰好增加 N；相同 `request_id` 的并发重复只执行一次。
+4. 并发 N 笔成交后 `version` 恰好增加 N；相同 `request_id` 的并发重复只执行一次；
+5. 按侧恒等式 `reserve == deposited − withdrawn + swap_in − swap_out` 恒成立，
+   池子统计与逐笔流水重推结果完全一致；
+6. 被拒绝的请求不产生手续费、不改变成交统计，但留痕可查；
+7. 暂停期间请求全部明确失败且资金状态不变，恢复后从正确存量继续；
+8. 重复初始化不叠加存量与份额（同配置幂等返回，不同配置明确拒绝）。
 
 ## 说明与限制
 

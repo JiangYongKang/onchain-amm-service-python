@@ -17,6 +17,17 @@ from __future__ import annotations
 FEE_DENOMINATOR = 1_000_000
 
 
+def effective_input(amount_in: int, fee_ppm: int) -> int:
+    """扣费后的有效输入：floor(amount_in * (1e6 - fee_ppm) / 1e6)。
+
+    手续费口径：fee = amount_in - effective_input(amount_in, fee_ppm)，
+    手续费留在输入侧库存中，归池子（按份额比例归属流动性提供者）。
+    """
+    if amount_in <= 0:
+        return 0
+    return amount_in * (FEE_DENOMINATOR - fee_ppm) // FEE_DENOMINATOR
+
+
 def amount_out(amount_in: int, reserve_in: int, reserve_out: int, fee_ppm: int) -> int:
     """给定输入数量，返回可获得的输出数量（向下取整）。
 

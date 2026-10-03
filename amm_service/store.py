@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from .models import IdempotentResult, PoolState, Position
+from .models import IdempotentResult, LedgerRecord, PoolState, Position
 
 
 @dataclass
@@ -22,6 +22,8 @@ class Store:
     positions: dict[tuple[str, str], Position] = field(default_factory=dict)
     idempotency: dict[tuple[str, str], IdempotentResult] = field(default_factory=dict)
     pool_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    ledger: list[LedgerRecord] = field(default_factory=list)
+    _ledger_seq: int = 0
     _guard: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def pool_lock(self, pool_id: str) -> asyncio.Lock:
@@ -44,8 +46,21 @@ class Store:
     def get_position(self, pool_id: str, user: str) -> Position:
         return self.positions.setdefault((pool_id, user), Position())
 
+    def append_ledger(self, record: LedgerRecord) -> LedgerRecord:
+        """追加流水并分配全局序号。
+
+        调用方均处于某把池子锁内、且本方法无 await，
+        单进程 asyncio 下序号分配是原子的。
+        """
+        self._ledger_seq += 1
+        record.seq = self._ledger_seq
+        self.ledger.append(record)
+        return record
+
     def reset(self) -> None:
         self.pools.clear()
         self.positions.clear()
         self.idempotency.clear()
         self.pool_locks.clear()
+        self.ledger.clear()
+        self._ledger_seq = 0

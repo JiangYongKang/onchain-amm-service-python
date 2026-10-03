@@ -5,9 +5,11 @@ from fastapi import APIRouter
 
 from .schemas import (
     AddLiquidityRequest,
+    PauseRequest,
     QuoteRequest,
     RemoveLiquidityRequest,
     SeedPoolRequest,
+    SetPolicyRequest,
     SwapRequest,
 )
 from .service import AmmService
@@ -74,7 +76,49 @@ async def get_position(pool_id: str, user: str) -> dict:
     return {"ok": True, "result": await service.get_position(pool_id, user)}
 
 
+@router.post("/admin/pools/{pool_id}/policy")
+async def set_policy(pool_id: str, req: SetPolicyRequest) -> dict:
+    result = await service.set_pool_policy(
+        pool_id, max_swap_in=req.max_swap_in, reserve_buffer=req.reserve_buffer,
+    )
+    return {"ok": True, "result": result}
+
+
+@router.post("/admin/pools/{pool_id}/pause")
+async def pause(pool_id: str, req: PauseRequest) -> dict:
+    result = await service.set_pause(pool_id, req.op, True)
+    return {"ok": True, "result": result}
+
+
+@router.post("/admin/pools/{pool_id}/resume")
+async def resume(pool_id: str, req: PauseRequest) -> dict:
+    result = await service.set_pause(pool_id, req.op, False)
+    return {"ok": True, "result": result}
+
+
+@router.get("/pools/{pool_id}/stats")
+async def pool_stats(pool_id: str) -> dict:
+    return {"ok": True, "result": await service.get_pool_stats(pool_id)}
+
+
+@router.get("/pools/{pool_id}/users/{user}/stats")
+async def user_stats(pool_id: str, user: str) -> dict:
+    return {"ok": True, "result": await service.get_user_stats(pool_id, user)}
+
+
+@router.get("/history")
+async def history(pool_id: str | None = None, user: str | None = None,
+                  op: str | None = None, status: str | None = None,
+                  since_ms: int | None = None, until_ms: int | None = None,
+                  page: int = 1, page_size: int = 50) -> dict:
+    result = await service.get_history(
+        pool_id=pool_id, user=user, op=op, status=status,
+        since_ms=since_ms, until_ms=until_ms, page=page, page_size=page_size,
+    )
+    return {"ok": True, "result": result}
+
+
 @router.post("/admin/reset")
 async def reset() -> dict:
-    await service.reset()
+    service.reset()
     return {"ok": True}

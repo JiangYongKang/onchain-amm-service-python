@@ -41,3 +41,19 @@ class InsufficientShareBalance(AmmError):
 
 class DuplicateRequestConflict(AmmError):
     code = "DUPLICATE_REQUEST_CONFLICT"
+
+
+class PoolAlreadyExists(AmmError):
+    code = "POOL_ALREADY_EXISTS"
+
+
+class PoolPaused(AmmError):
+    code = "POOL_PAUSED"
+
+
+class AmountLimitExceeded(AmmError):
+    code = "AMOUNT_LIMIT_EXCEEDED"
+
+
+class ReserveBufferBreach(AmmError):
+    code = "RESERVE_BUFFER_BREACH"

@@ -49,3 +49,12 @@ class QuoteRequest(BaseModel):
     pool_id: str
     side: str
     amount_in: int = Field(ge=0)
+
+
+class SetPolicyRequest(BaseModel):
+    max_swap_in: int | None = Field(default=None, ge=0)
+    reserve_buffer: int | None = Field(default=None, ge=0)
+
+
+class PauseRequest(BaseModel):
+    op: str  # "swap" | "add" | "remove"
