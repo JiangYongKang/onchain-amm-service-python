@@ -14,6 +14,7 @@ amm_service/
   errors.py    # 错误码与业务异常（失败原因稳定可区分）
   models.py    # 领域模型：池子状态、持仓、报价、幂等记录
   pricing.py   # 纯函数计价口径（兑换/份额/赎回）
+  reconcile.py # 仅凭历史流水的对账重算（纯函数 fold）
   store.py     # 本地内存状态 + 每池并发锁
   service.py   # 业务编排：校验、幂等、并发、结构化日志
   schemas.py   # HTTP 请求模型
@@ -130,15 +131,41 @@ out_y = floor( shares * Ry / S )
   （兑换流量）、`fee_*`（手续费累计）、`swap_count_*`（分方向笔数）。
   `GET /pools/{pool_id}/stats` 返回全部计数器与净本金
   `principal_* = deposited_* - withdrawn_*`。
+  - **本金口径**：只有流动性注入/赎回影响本金。每笔成功注入把两侧**实际存入
+    金额** `detail.amount_x/amount_y` 计入 `deposited_*`（含成功铸造的份额
+    `detail.shares`）；每笔成功赎回把**实际取出**的两侧数量
+    `detail.amount_x/amount_y` 计入 `withdrawn_*`（被销毁的份额严格等于
+    `detail.shares_burned`）。非等比注入时超出比例、捐赠留存的部分同样计入
+    本金（它确实进了池子）；赎回 floor 留下的 dust 仍是池子本金的一部分，
+    不计入任何用户的 `withdrawn_*`。
+  - **手续费口径**：只有成功兑换产生手续费。`fee_in = amount_in -
+    floor(amount_in*(1e6-fee_ppm)/1e6)`，按输入代币方向计入 `fee_x/fee_y`，
+    手续费留在输入侧库存，按当前份额比例归全体流动性提供者；用户统计里的
+    `fee_share_* = floor(shares * fee_total / total_shares)` 是**按当前持仓
+    快照**的应得分成，不是流水累计量。
+  - **用户贡献口径**：`GET /pools/{pool_id}/users/{user}/stats` 的
+    `contributed_*` 为该用户全部成功注入的 `amount_*` 逐笔求和，
+    `withdrawn_*` 为其全部成功赎回取出量逐笔求和；`shares` 为
+    Σ成功注入 `shares` − Σ成功赎回 `shares_burned`。seed 初始库存对应的
+    份额与贡献记在系统账户 `_system` 名下，因此把 `_system` 一并重算即可
+    对平整个池子。
 - **库存恒等式**（测试强制断言，可按侧核对）：
 
   ```
   reserve == deposited - withdrawn + swap_in - swap_out
   ```
 
-- **可从流水重推**：每笔成功兑换在流水 `detail` 中记录
-  `side / amount_in / amount_out / fee_in`，统计端点的每个数字都等于对
-  `GET /history?op=swap&status=success` 逐笔求和的结果（测试逐字段断言）。
+- **可从流水重推**：每笔成功操作的流水 `detail` 都带齐还原要素——
+  - 兑换：`side / amount_in / amount_out / fee_in`；
+  - 注入：`amount_x / amount_y`（两侧实际存入）+ `shares`（实际铸出份额）；
+  - 赎回：`shares_burned`（实际烧掉份额）+ `amount_x / amount_y`（两侧实际
+    取出）；
+  - seed：`reserve_x / reserve_y / total_shares`。
+
+  统计端点的每个数字都等于对 `GET /history?status=success` 按 `seq` 顺序
+  逐笔求和的结果（测试逐字段断言，含被拒绝请求、重复提交与并发场景）。
+  成功响应同时向后兼容地追加了相同字段：注入响应新增 `amount_x/amount_y`，
+  赎回响应新增 `shares_burned`；既有字段含义不变。
 - **用户视角**：`GET /pools/{pool_id}/users/{user}/stats` 返回
   `shares`、`share_ppm`（份额占比，百万分比）、`fee_share_x/y`
   （应得手续费分成 = `floor(shares * fee_total / total_shares)`，按当前
@@ -150,7 +177,10 @@ out_y = floor( shares * Ry / S )
 
 - 每笔**成功与被拒绝**的操作（含 seed、policy、pause/resume 管理操作）
   都写一条流水：全局单调 `seq`、`ts_ms`、池子、用户、操作类型、
-  `request_id`、状态与失败原因码、业务明细 `detail`。
+  `request_id`、状态与失败原因码、业务明细 `detail`。成功记录的 `detail`
+  带齐还原要素（兑换：`side/amount_in/amount_out/fee_in`；注入：
+  `amount_x/amount_y/shares`；赎回：`shares_burned/amount_x/amount_y`；
+  seed：`reserve_x/reserve_y/total_shares`），可直接用于对账重算。
 - **幂等去重**：同一 `(操作类型, request_id)` 只记一条；成功/失败的重放
   以及池不存在的重复请求都不会产生第二条记录。
 - **查询**：`GET /history`，过滤参数 `pool_id`、`user`、`op`
@@ -158,6 +188,60 @@ out_y = floor( shares * Ry / S )
   （success/rejected）、`since_ms`/`until_ms`（闭区间），分页参数
   `page`（>=1）、`page_size`（1..500）。每页返回的 `total` 恒等于
   过滤后的记录总数；参数非法以 `INVALID_PARAMETER` 明确拒绝。
+
+## 仅凭历史流水对账重算
+
+对账原则：**统计接口报出的任何累计数字，都不依赖进程内计数器，仅凭
+`GET /history` 的流水就能逐笔重算出来，且逐字段、逐舍入一致。**
+
+- 只有 `status == "success"` 的记录参与重算；`rejected` 记录（滑点、持仓
+  不足、暂停、池不存在、同 id 冲突等）仅用于追溯，必须能按 `error_code`
+  区分原因，但不改变任何本金/手续费/份额口径。
+- 同一 `(op, request_id)` 只有一条记录：成功重放与失败重放都不产生第二条，
+  因此任何一笔请求在重算中至多被累计一次。
+- 重算按 `seq` 升序进行（与真实提交顺序一致）；全部运算为整数求和，唯一的
+  除法（用户 `share_ppm`、`fee_share_*`）与接口一样使用向下取整，因此不会
+  出现重算比接口多一分/少一分。
+
+### 逐类流水的折叠规则
+
+| op | 成功 `detail` 要素 | 对池子累计的贡献 | 对用户（`record.user`）的贡献 |
+| --- | --- | --- | --- |
+| `seed` | `reserve_x, reserve_y, total_shares` | `deposited_* += reserve_*`；`total_shares += detail.total_shares` | 份额与本金记到系统账户 `_system` |
+| `add` | `amount_x, amount_y, shares` | `deposited_* += amount_*`；`total_shares += shares` | `contributed_* += amount_*`；`shares += shares` |
+| `remove` | `shares_burned, amount_x, amount_y` | `withdrawn_* += amount_*`；`total_shares -= shares_burned` | `withdrawn_* += amount_*`；`shares -= shares_burned` |
+| `swap` | `side, amount_in, amount_out, fee_in` | 按方向累计 `swap_in_* / swap_out_* / fee_* / swap_count_*` | 不影响份额与本金 |
+| `policy/pause/resume` | — | 仅管理动作，不参与金额重算 | — |
+
+折叠完成后：
+
+```
+principal_* = deposited_* - withdrawn_*          # 池子净本金
+reserve_*   = principal_* + swap_in_* - swap_out_*   # 库存恒等式（按侧）
+sum(所有用户 shares，含 _system) == total_shares     # 份额守恒
+share_ppm   = floor(shares * 1_000_000 / total_shares)
+fee_share_* = floor(shares * fee_* / total_shares)   # 当前持仓快照、向下取整
+```
+
+### 代码入口与本地验证
+
+重算逻辑是无副作用的纯函数（`amm_service/reconcile.py`），服务层提供
+`AmmService.replay_from_history(pool_id)` 自动分页拉全流水并折叠：
+
+```python
+replay = await service.replay_from_history("p1")
+replay.pool_stats_view()          # 与 GET /pools/p1/stats 逐字段对比
+replay.user_stats_view("alice")   # 与 GET /pools/p1/users/alice/stats 对比
+```
+
+```bash
+uv run pytest tests/test_reconcile.py -v   # 流水重算不变量（见下）
+```
+
+`tests/test_reconcile.py` 稳定覆盖「仅凭流水重算 == 统计接口」这条不变量，
+场景包含：注入/赎回/兑换混合（含非等比注入与非整除赎回 dust）、各类被拒绝
+请求、成功/失败重复提交与并发重复、多用户并发混合操作；并发用例还在提交
+过程中反复取快照断言份额守恒与库存恒等式（任何时刻都不凭空多/少资产）。
 
 ## 容量与熔断
 
@@ -231,6 +315,7 @@ uv run pytest tests/test_concurrency.py -v   # 并发与幂等
 uv run pytest tests/test_swap.py -v          # 兑换保护
 uv run pytest tests/test_fees_stats.py -v    # 手续费对账与用户统计
 uv run pytest tests/test_history.py -v       # 流水历史与分页
+uv run pytest tests/test_reconcile.py -v     # 仅凭流水重算 == 统计接口
 uv run pytest tests/test_policy.py -v        # 容量、熔断、重复初始化
 uv run pytest tests/test_ops_api.py -v       # 新能力的 HTTP 端到端
 
@@ -254,8 +339,12 @@ idempotency_replay {"decision":"replayed", ...}
 3. 持仓总和 == 总份额；
 4. 并发 N 笔成交后 `version` 恰好增加 N；相同 `request_id` 的并发重复只执行一次；
 5. 按侧恒等式 `reserve == deposited − withdrawn + swap_in − swap_out` 恒成立，
-   池子统计与逐笔流水重推结果完全一致；
-6. 被拒绝的请求不产生手续费、不改变成交统计，但留痕可查；
+   池子统计、用户统计（份额/贡献/赎回/占比/手续费分成）与逐笔流水重推结果
+   完全一致——注入带两侧存入与铸出份额、赎回带烧掉份额与两侧取出，仅凭
+   `GET /history` 即可重算全部口径（`tests/test_reconcile.py` 覆盖混合操作、
+   被拒绝请求、重复提交与并发）；
+6. 被拒绝的请求不产生手续费、不改变成交统计、不改变本金与份额，但留痕可查
+   且失败原因可区分；
 7. 暂停期间请求全部明确失败且资金状态不变，恢复后从正确存量继续；
 8. 重复初始化不叠加存量与份额（同配置幂等返回，不同配置明确拒绝）。
 

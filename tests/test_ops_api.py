@@ -48,6 +48,38 @@ def test_stats_and_user_stats_over_http(client):
              stats["fee_x"], stats["swap_count"], user["fee_share_x"])
 
 
+def test_ledger_details_carry_replay_elements_over_http(client):
+    """业务：HTTP 成功响应与流水明细带齐对账要素（追加字段，向后兼容）。"""
+    _seed(client)
+    add = client.post("/liquidity/add", json={
+        "request_id": "a1", "pool_id": "p", "user": "bob",
+        "amount_x": 10_000, "amount_y": 10_000}).json()["result"]
+    # 成功响应：既有 shares 保留，追加两侧实际存入金额
+    assert add["shares"] == 10_000
+    assert add["amount_x"] == 10_000 and add["amount_y"] == 10_000
+
+    rm = client.post("/liquidity/remove", json={
+        "request_id": "r1", "pool_id": "p", "user": "bob",
+        "shares": 3_000}).json()["result"]
+    # 成功响应：既有 amount_x/y、remaining_shares 保留，追加烧掉份额
+    assert rm["amount_x"] == rm["amount_y"] == 3_000
+    assert rm["remaining_shares"] == 7_000
+    assert rm["shares_burned"] == 3_000
+
+    def detail(op, request_id):
+        items = client.get("/history", params={
+            "pool_id": "p", "op": op, "status": "success"}).json()["result"]["items"]
+        return next(i["detail"] for i in items if i["request_id"] == request_id)
+
+    assert detail("add", "a1") == {"shares": 10_000,
+                                   "amount_x": 10_000, "amount_y": 10_000}
+    assert detail("remove", "r1") == {
+        "amount_x": 3_000, "amount_y": 3_000,
+        "shares_burned": 3_000, "remaining_shares": 7_000}
+    log.info("http ledger details: add{amount_x,amount_y,shares} and "
+             "remove{shares_burned,amount_x,amount_y} present; legacy fields kept")
+
+
 def test_history_over_http_with_pagination(client):
     """业务：HTTP 流水查询，过滤+分页，total 与过滤结果一致。"""
     _seed(client)

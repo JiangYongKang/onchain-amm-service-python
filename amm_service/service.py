@@ -38,6 +38,7 @@ from .errors import (
 )
 from .models import IdempotentResult, LedgerRecord, PoolState
 from . import pricing
+from . import reconcile
 from .store import Store
 
 logger = logging.getLogger("amm.service")
@@ -330,6 +331,27 @@ class AmmService:
             "detail": r.detail,
         }
 
+    async def replay_from_history(self, pool_id: str | None = None
+                                  ) -> reconcile.LedgerReplay:
+        """仅凭 GET /history 的分页流水重算池子/用户全部累计口径。
+
+        对账入口：逐页拉全（含成功与被拒记录，重算时后者自动跳过），
+        按 seq fold。pool_id 给定时只取该池流水（跨池 request_id 不冲突，
+        因为幂等键带 scope、流水按池过滤即可）。
+        """
+        page_size = self.MAX_PAGE_SIZE
+        page = 1
+        items: list[dict] = []
+        while True:
+            hist = await self.get_history(
+                pool_id=pool_id, page=page, page_size=page_size,
+            )
+            items.extend(hist["items"])
+            if page * page_size >= hist["total"]:
+                break
+            page += 1
+        return reconcile.replay_ledger(items)
+
     async def quote(self, *, pool_id: str, side: str, amount_in: int) -> dict:
         if side not in VALID_SIDES:
             raise InvalidParameter(f"side must be one of {VALID_SIDES}")
@@ -405,6 +427,9 @@ class AmmService:
             pos.contributed_x += amount_x
             pos.contributed_y += amount_y
             result = {"request_id": request_id, "shares": shares,
+                      # 追加（向后兼容）：两侧实际存入金额，使流水足以重算
+                      # 池子本金与用户累计贡献；既有字段含义不变。
+                      "amount_x": amount_x, "amount_y": amount_y,
                       "replayed": False, "pool": self._pool_view(pool)}
             _log_event(
                 "add_liquidity", decision="accepted", request_id=request_id,
@@ -477,6 +502,9 @@ class AmmService:
             result = {
                 "request_id": request_id,
                 "amount_x": out_x, "amount_y": out_y,
+                # 追加（向后兼容）：实际烧掉的份额，使流水足以重算
+                # 用户持仓、累计赎回与池子总份额；既有字段含义不变。
+                "shares_burned": shares,
                 "remaining_shares": pos.shares,
                 "replayed": False, "pool": self._pool_view(pool),
             }
