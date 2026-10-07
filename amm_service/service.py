@@ -316,6 +316,21 @@ class AmmService:
         )
         return result
 
+    async def recompute_stats_from_history(self, pool_id: str) -> dict:
+        """对账入口：仅凭该池子的完整历史流水逐笔重算池子/用户口径。
+
+        与 GET /pools/{id}/stats 及用户统计端点同口径（整数、向下取整），
+        用于离线核对「统计接口报出的数字 == 流水逐笔算出来的数字」。
+        只消费成功的 seed/add/remove/swap 流水；被拒绝记录与管理操作
+        不参与金额口径（但仍可通过 get_history 查到）。
+        """
+        from .reconciliation import recompute_from_records
+
+        self.store.get_pool(pool_id)  # 不存在则 POOL_NOT_FOUND，与统计端点一致
+        records = [self._record_view(r) for r in self.store.ledger
+                   if r.pool_id == pool_id]
+        return recompute_from_records(records, pool_id=pool_id)
+
     @staticmethod
     def _record_view(r: LedgerRecord) -> dict:
         return {
@@ -405,6 +420,9 @@ class AmmService:
             pos.contributed_x += amount_x
             pos.contributed_y += amount_y
             result = {"request_id": request_id, "shares": shares,
+                      # 向后兼容地追加两侧实际存入金额：仅凭流水即可还原本金口径，
+                      # 既有 shares 字段含义不变。
+                      "amount_x": amount_x, "amount_y": amount_y,
                       "replayed": False, "pool": self._pool_view(pool)}
             _log_event(
                 "add_liquidity", decision="accepted", request_id=request_id,
@@ -477,6 +495,9 @@ class AmmService:
             result = {
                 "request_id": request_id,
                 "amount_x": out_x, "amount_y": out_y,
+                # 向后兼容地追加实际销毁份额：仅凭流水即可还原用户持仓与
+                # 份额守恒，既有 amount_x/amount_y/remaining_shares 含义不变。
+                "shares_burned": shares,
                 "remaining_shares": pos.shares,
                 "replayed": False, "pool": self._pool_view(pool),
             }

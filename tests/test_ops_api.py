@@ -106,6 +106,36 @@ def test_policy_and_pause_over_http(client):
              "AMOUNT_LIMIT_EXCEEDED / POOL_PAUSED distinguishable")
 
 
+def test_recompute_endpoint_matches_stats_over_http(client):
+    """业务：HTTP 流水重算端点与 stats/user-stats 逐字段一致（含拒绝不参与）。"""
+    _seed(client)
+    r = client.post("/liquidity/add", json={
+        "request_id": "a1", "pool_id": "p", "user": "alice",
+        "amount_x": 10_000, "amount_y": 10_000})
+    assert r.status_code == 200
+    # 注入成功明细：两侧金额 + 铸出份额都可在流水里看到
+    detail = r.json()["result"]
+    assert detail["shares"] == 10_000
+    assert detail["amount_x"] == detail["amount_y"] == 10_000
+    _swap(client, "s1", amount_in=10_000)
+    r = client.post("/liquidity/remove", json={
+        "request_id": "r1", "pool_id": "p", "user": "alice", "shares": 4_000})
+    assert r.status_code == 200
+    # 赎回成功明细：销毁份额 + 两侧取出数量
+    rm = r.json()["result"]
+    assert rm["shares_burned"] == 4_000 and rm["amount_x"] > 0 and rm["amount_y"] > 0
+    # 一笔被拒绝兑换：留痕但不参与口径
+    assert _swap(client, "bad", amount_in=1000, min_out=10**9).status_code == 422
+
+    stats = client.get("/pools/p/stats").json()["result"]
+    rc = client.get("/pools/p/recompute").json()["result"]
+    assert rc["pools"]["p"] == stats
+    alice_live = client.get("/pools/p/users/alice/stats").json()["result"]
+    assert rc["users"]["p"]["alice"] == alice_live
+    log.info("http recompute: pool stats == ledger recompute field-by-field; "
+             "alice=%s; rejected swap excluded but traceable", alice_live)
+
+
 def test_reseed_over_http(client):
     """业务：HTTP 重复初始化——同配置原样返回，不同配置 422。"""
     _seed(client)

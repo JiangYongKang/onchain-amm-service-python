@@ -106,6 +106,12 @@ async def user_stats(pool_id: str, user: str) -> dict:
     return {"ok": True, "result": await service.get_user_stats(pool_id, user)}
 
 
+@router.get("/pools/{pool_id}/recompute")
+async def recompute_stats(pool_id: str) -> dict:
+    """仅凭历史流水重算池子/用户口径（对账核对用，与 stats 端点逐字段一致）。"""
+    return {"ok": True, "result": await service.recompute_stats_from_history(pool_id)}
+
+
 @router.get("/history")
 async def history(pool_id: str | None = None, user: str | None = None,
                   op: str | None = None, status: str | None = None,
